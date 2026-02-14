@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Confounders in Regression — Interactive Teaching Tool</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: linear-gradient(160deg, #0d1117 0%, #111822 40%, #0f1a24 100%); min-height: 100vh; }
+  button { font-family: 'DM Sans', sans-serif; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback } = React;
+
+const SCENARIOS = [
+  {
+    id: "ice-cream",
+    title: "Ice Cream & Drowning",
+    domain: "Classic Example",
+    x: "Ice Cream Sales",
+    y: "Drowning Deaths",
+    confounder: "Temperature",
+    xUnit: "gallons sold",
+    yUnit: "deaths",
+    description:
+      "A naive regression of drowning deaths on ice cream sales shows a strong positive relationship. But does ice cream cause drowning?",
+    explanation:
+      "Temperature drives both ice cream sales (people buy more when it's hot) and drowning deaths (more people swim when it's hot). Once we control for temperature, the apparent relationship between ice cream and drowning disappears.",
+    trueEffect: 0,
+    confoundStrengthX: 0.8,
+    confoundStrengthY: 0.75,
+    noise: 0.3,
+  },
+  {
+    id: "police",
+    title: "Police Spending & Crime",
+    domain: "Policy",
+    x: "Police Budget ($M)",
+    y: "Crime Rate",
+    confounder: "Poverty Rate",
+    xUnit: "$M",
+    yUnit: "per 100k",
+    description:
+      "Cities with higher police budgets often have higher crime rates. Does more policing cause more crime?",
+    explanation:
+      "Poverty drives both outcomes: high-poverty areas tend to have more crime AND more police spending in response. The confounded estimate is misleading. Controlling for poverty reveals a modest negative effect of police spending on crime.",
+    trueEffect: -0.3,
+    confoundStrengthX: 0.7,
+    confoundStrengthY: 0.85,
+    noise: 0.35,
+  },
+  {
+    id: "hospital",
+    title: "Hospital Size & Mortality",
+    domain: "Health Policy",
+    x: "Hospital Bed Count",
+    y: "Patient Mortality Rate",
+    confounder: "Case Severity Mix",
+    xUnit: "beds",
+    yUnit: "% mortality",
+    description:
+      "Larger hospitals appear to have higher mortality rates. Should policy discourage large hospitals?",
+    explanation:
+      "Larger hospitals attract more severe, complex cases (trauma centers, transplant programs). Case severity drives both hospital size and mortality. Adjusting for severity often reveals that larger hospitals actually have better outcomes.",
+    trueEffect: -0.25,
+    confoundStrengthX: 0.75,
+    confoundStrengthY: 0.8,
+    noise: 0.3,
+  },
+  {
+    id: "education",
+    title: "Class Size & Test Scores",
+    domain: "Education Policy",
+    x: "Class Size",
+    y: "Test Scores",
+    confounder: "School District Wealth",
+    xUnit: "students",
+    yUnit: "avg score",
+    description:
+      "Some studies find smaller classes correlate with higher test scores. But is the relationship causal?",
+    explanation:
+      "Wealthier districts can afford smaller classes AND their students tend to score higher due to other advantages (tutoring, resources, stability). District wealth confounds the relationship, making the class-size effect appear larger than it truly is.",
+    trueEffect: -0.15,
+    confoundStrengthX: -0.7,
+    confoundStrengthY: 0.8,
+    noise: 0.35,
+  },
+];
+
+function seededRandom(seed) {
+  let s = seed;
+  return () => {
+    s = (s * 16807 + 0) % 2147483647;
+    return s / 2147483647;
+  };
+}
+
+function generateData(scenario, n = 80) {
+  const rand = seededRandom(scenario.id.length * 1000 + 42);
+  const gauss = () => {
+    let u = 0, v = 0;
+    while (u === 0) u = rand();
+    while (v === 0) v = rand();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  const points = [];
+  for (let i = 0; i < n; i++) {
+    const z = gauss();
+    const x = scenario.confoundStrengthX * z + scenario.noise * gauss();
+    const y = scenario.trueEffect * x + scenario.confoundStrengthY * z + scenario.noise * gauss();
+    points.push({ x, y, z });
+  }
+  return points;
+}
+
+function linearRegression(points, key = "x") {
+  const n = points.length;
+  const sumX = points.reduce((s, p) => s + p[key], 0);
+  const sumY = points.reduce((s, p) => s + p.y, 0);
+  const sumXY = points.reduce((s, p) => s + p[key] * p.y, 0);
+  const sumX2 = points.reduce((s, p) => s + p[key] * p[key], 0);
+  const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+  const intercept = (sumY - slope * sumX) / n;
+  return { slope, intercept };
+}
+
+function multipleRegression(points) {
+  const n = points.length;
+  const mX = points.reduce((s, p) => s + p.x, 0) / n;
+  const mY = points.reduce((s, p) => s + p.y, 0) / n;
+  const mZ = points.reduce((s, p) => s + p.z, 0) / n;
+  let sxx = 0, szz = 0, sxy = 0, szy = 0, sxz = 0;
+  for (const p of points) {
+    const dx = p.x - mX, dy = p.y - mY, dz = p.z - mZ;
+    sxx += dx * dx;
+    szz += dz * dz;
+    sxy += dx * dy;
+    szy += dz * dy;
+    sxz += dx * dz;
+  }
+  const det = sxx * szz - sxz * sxz;
+  const bX = (szz * sxy - sxz * szy) / det;
+  return { slopeX: bX };
+}
+
+function ScatterPlot({ data, width, height, showConfounder, scenario, controlled }) {
+  const pad = { top: 20, right: 20, bottom: 40, left: 50 };
+  const w = width - pad.left - pad.right;
+  const h = height - pad.top - pad.bottom;
+
+  const xExt = useMemo(() => {
+    const xs = data.map((d) => d.x);
+    const mn = Math.min(...xs), mx = Math.max(...xs);
+    const buf = (mx - mn) * 0.1;
+    return [mn - buf, mx + buf];
+  }, [data]);
+
+  const yExt = useMemo(() => {
+    const ys = data.map((d) => d.y);
+    const mn = Math.min(...ys), mx = Math.max(...ys);
+    const buf = (mx - mn) * 0.1;
+    return [mn - buf, mx + buf];
+  }, [data]);
+
+  const zExt = useMemo(() => {
+    const zs = data.map((d) => d.z);
+    return [Math.min(...zs), Math.max(...zs)];
+  }, [data]);
+
+  const sx = (v) => pad.left + ((v - xExt[0]) / (xExt[1] - xExt[0])) * w;
+  const sy = (v) => pad.top + h - ((v - yExt[0]) / (yExt[1] - yExt[0])) * h;
+
+  const getColor = (z) => {
+    if (!showConfounder) return "rgba(100, 140, 180, 0.6)";
+    const t = (z - zExt[0]) / (zExt[1] - zExt[0]);
+    const r = Math.round(40 + t * 200);
+    const g = Math.round(80 + (1 - Math.abs(t - 0.5) * 2) * 60);
+    const b = Math.round(200 - t * 160);
+    return `rgba(${r}, ${g}, ${b}, 0.7)`;
+  };
+
+  const naive = linearRegression(data, "x");
+  const multi = multipleRegression(data);
+  const lineY1 = naive.slope * xExt[0] + naive.intercept;
+  const lineY2 = naive.slope * xExt[1] + naive.intercept;
+
+  let controlledLine = null;
+  if (controlled) {
+    const mX = data.reduce((s, p) => s + p.x, 0) / data.length;
+    const mY = data.reduce((s, p) => s + p.y, 0) / data.length;
+    const intercept2 = mY - multi.slopeX * mX;
+    const ly1 = multi.slopeX * xExt[0] + intercept2;
+    const ly2 = multi.slopeX * xExt[1] + intercept2;
+    controlledLine = (
+      <line x1={sx(xExt[0])} y1={sy(ly1)} x2={sx(xExt[1])} y2={sy(ly2)}
+        stroke="rgba(100, 220, 160, 0.9)" strokeWidth={2.5} />
+    );
+  }
+
+  return (
+    <svg width={width} height={height} style={{ overflow: "visible", maxWidth: "100%" }}>
+      {[0.25, 0.5, 0.75].map((t) => (
+        <line key={`gx${t}`} x1={pad.left + w * t} y1={pad.top} x2={pad.left + w * t} y2={pad.top + h}
+          stroke="rgba(255,255,255,0.06)" strokeWidth={1} />
+      ))}
+      {[0.25, 0.5, 0.75].map((t) => (
+        <line key={`gy${t}`} x1={pad.left} y1={pad.top + h * t} x2={pad.left + w} y2={pad.top + h * t}
+          stroke="rgba(255,255,255,0.06)" strokeWidth={1} />
+      ))}
+      <line x1={pad.left} y1={pad.top + h} x2={pad.left + w} y2={pad.top + h} stroke="rgba(255,255,255,0.3)" />
+      <line x1={pad.left} y1={pad.top} x2={pad.left} y2={pad.top + h} stroke="rgba(255,255,255,0.3)" />
+      <text x={pad.left + w / 2} y={height - 4} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={11} fontFamily="'DM Sans', sans-serif">{scenario.x}</text>
+      <text x={14} y={pad.top + h / 2} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={11} fontFamily="'DM Sans', sans-serif"
+        transform={`rotate(-90, 14, ${pad.top + h / 2})`}>{scenario.y}</text>
+      <line x1={sx(xExt[0])} y1={sy(lineY1)} x2={sx(xExt[1])} y2={sy(lineY2)}
+        stroke={controlled ? "rgba(255,100,100,0.3)" : "rgba(255,100,100,0.8)"}
+        strokeWidth={controlled ? 1.5 : 2.5}
+        strokeDasharray={controlled ? "6 4" : "none"} />
+      {controlledLine}
+      {data.map((d, i) => (
+        <circle key={i} cx={sx(d.x)} cy={sy(d.y)} r={4.5}
+          fill={getColor(d.z)} stroke="rgba(255,255,255,0.15)" strokeWidth={0.5} />
+      ))}
+    </svg>
+  );
+}
+
+function DAGDiagram({ scenario, showConfounder, controlled }) {
+  const w = 320, h = 180;
+  const xPos = { x: 60, y: 130 };
+  const yPos = { x: 260, y: 130 };
+  const zPos = { x: 160, y: 30 };
+
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{ maxWidth: "100%" }}>
+      {showConfounder && (
+        <React.Fragment>
+          <defs>
+            <marker id="ah-conf" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+              <polygon points="0 0, 8 3, 0 6" fill={controlled ? "rgba(100,220,160,0.8)" : "rgba(255,180,80,0.8)"} />
+            </marker>
+          </defs>
+          <line x1={zPos.x - 30} y1={zPos.y + 20} x2={xPos.x + 20} y2={xPos.y - 20}
+            stroke={controlled ? "rgba(100,220,160,0.6)" : "rgba(255,180,80,0.7)"}
+            strokeWidth={2} markerEnd="url(#ah-conf)"
+            strokeDasharray={controlled ? "4 3" : "none"} />
+          <line x1={zPos.x + 30} y1={zPos.y + 20} x2={yPos.x - 20} y2={yPos.y - 20}
+            stroke={controlled ? "rgba(100,220,160,0.6)" : "rgba(255,180,80,0.7)"}
+            strokeWidth={2} markerEnd="url(#ah-conf)"
+            strokeDasharray={controlled ? "4 3" : "none"} />
+        </React.Fragment>
+      )}
+      <defs>
+        <marker id="ah-main" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="rgba(100,140,180,0.9)" />
+        </marker>
+      </defs>
+      <line x1={xPos.x + 35} y1={xPos.y} x2={yPos.x - 35} y2={yPos.y}
+        stroke="rgba(100,140,180,0.7)" strokeWidth={2} markerEnd="url(#ah-main)" />
+      <circle cx={xPos.x} cy={xPos.y} r={28} fill="rgba(100,140,180,0.15)" stroke="rgba(100,140,180,0.5)" strokeWidth={1.5} />
+      <text x={xPos.x} y={xPos.y + 1} textAnchor="middle" dominantBaseline="middle" fill="rgba(200,220,240,0.9)" fontSize={10} fontWeight={600} fontFamily="'DM Sans', sans-serif">X</text>
+      <text x={xPos.x} y={xPos.y + 42} textAnchor="middle" fill="rgba(255,255,255,0.4)" fontSize={9} fontFamily="'DM Sans', sans-serif">
+        {scenario.x.length > 14 ? scenario.x.slice(0, 14) + "\u2026" : scenario.x}
+      </text>
+      <circle cx={yPos.x} cy={yPos.y} r={28} fill="rgba(100,140,180,0.15)" stroke="rgba(100,140,180,0.5)" strokeWidth={1.5} />
+      <text x={yPos.x} y={yPos.y + 1} textAnchor="middle" dominantBaseline="middle" fill="rgba(200,220,240,0.9)" fontSize={10} fontWeight={600} fontFamily="'DM Sans', sans-serif">Y</text>
+      <text x={yPos.x} y={yPos.y + 42} textAnchor="middle" fill="rgba(255,255,255,0.4)" fontSize={9} fontFamily="'DM Sans', sans-serif">
+        {scenario.y.length > 14 ? scenario.y.slice(0, 14) + "\u2026" : scenario.y}
+      </text>
+      {showConfounder && (
+        <React.Fragment>
+          <circle cx={zPos.x} cy={zPos.y} r={28}
+            fill={controlled ? "rgba(100,220,160,0.1)" : "rgba(255,180,80,0.12)"}
+            stroke={controlled ? "rgba(100,220,160,0.5)" : "rgba(255,180,80,0.5)"}
+            strokeWidth={1.5} strokeDasharray={controlled ? "4 3" : "none"} />
+          <text x={zPos.x} y={zPos.y + 1} textAnchor="middle" dominantBaseline="middle"
+            fill={controlled ? "rgba(100,220,160,0.9)" : "rgba(255,180,80,0.9)"}
+            fontSize={10} fontWeight={600} fontFamily="'DM Sans', sans-serif">Z</text>
+          <text x={zPos.x} y={zPos.y + 42} textAnchor="middle"
+            fill={controlled ? "rgba(100,220,160,0.5)" : "rgba(255,180,80,0.5)"}
+            fontSize={9} fontFamily="'DM Sans', sans-serif">
+            {scenario.confounder.length > 16 ? scenario.confounder.slice(0, 16) + "\u2026" : scenario.confounder}
+          </text>
+        </React.Fragment>
+      )}
+    </svg>
+  );
+}
+
+function CoefficientBar({ label, value, color, maxAbs }) {
+  const pct = Math.min(Math.abs(value) / maxAbs, 1) * 100;
+  const isNeg = value < 0;
+  const barStyle = {
+    position: "absolute",
+    width: `${pct / 2}%`,
+    height: "100%",
+    borderRadius: 4,
+    background: color,
+    transition: "all 0.4s ease",
+  };
+  if (isNeg) {
+    barStyle.right = `${50 - pct / 2}%`;
+  } else {
+    barStyle.left = "50%";
+  }
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", fontFamily: "'DM Sans', sans-serif" }}>{label}</span>
+        <span style={{ fontSize: 12, color, fontWeight: 700, fontFamily: "'DM Mono', monospace" }}>
+          {"\u03B2"} = {value >= 0 ? "+" : ""}{value.toFixed(3)}
+        </span>
+      </div>
+      <div style={{ height: 8, borderRadius: 4, background: "rgba(255,255,255,0.06)", position: "relative", overflow: "hidden" }}>
+        <div style={barStyle} />
+        <div style={{ position: "absolute", left: "50%", top: 0, width: 1, height: "100%", background: "rgba(255,255,255,0.2)" }} />
+      </div>
+    </div>
+  );
+}
+
+const QUIZ_SCENARIOS = [
+  {
+    question: "A study finds that countries with more cell phone towers have higher cancer rates. A colleague suggests cell towers cause cancer. What\u2019s a likely confounder?",
+    options: ["Cell tower height", "Population density", "Cell phone brand", "Tower color"],
+    correct: 1,
+    explanation: "Population density drives both variables: densely populated areas need more cell towers AND have more cancer diagnoses simply because more people are counted. This is a classic example of a variable that creates a spurious correlation."
+  },
+  {
+    question: "A policy analyst finds that states with more gun laws have MORE gun deaths. They conclude gun laws increase deaths. What\u2019s a likely confounder?",
+    options: ["Number of gun stores", "Baseline gun violence rate", "State population", "Weather"],
+    correct: 1,
+    explanation: "States with high baseline gun violence are more likely to pass gun laws in response. The pre-existing violence rate confounds the relationship \u2014 it causes both more legislation AND more deaths. This is a policy-relevant case of reverse causality plus confounding."
+  },
+  {
+    question: "Research shows children who eat breakfast score higher on tests. A school board wants to mandate breakfast programs. What confounder should they consider?",
+    options: ["Type of cereal", "Household income/stability", "School bus schedule", "Lunchroom size"],
+    correct: 1,
+    explanation: "Household income and family stability affect both breakfast-eating habits and academic performance. Children from more resourced, stable homes are more likely to eat breakfast AND have other academic advantages. The true effect of breakfast on scores may be smaller than the naive estimate suggests."
+  },
+  {
+    question: "Data shows cities with more bike lanes have lower obesity rates. What variable likely confounds this relationship?",
+    options: ["Road width", "Urban density & demographics", "Bike lane color", "Number of bike shops"],
+    correct: 1,
+    explanation: "Cities that invest in bike infrastructure tend to be wealthier, more educated, and more health-conscious communities. These demographic factors independently reduce obesity rates, making bike lanes appear more effective than they may be on their own."
+  },
+];
+
+function ConfoundingTool() {
+  const [selectedScenario, setSelectedScenario] = useState(0);
+  const [showConfounder, setShowConfounder] = useState(false);
+  const [controlled, setControlled] = useState(false);
+  const [activeTab, setActiveTab] = useState("explore");
+  const [quizIndex, setQuizIndex] = useState(0);
+  const [quizAnswer, setQuizAnswer] = useState(null);
+  const [quizScore, setQuizScore] = useState(0);
+  const [quizDone, setQuizDone] = useState(false);
+
+  const scenario = SCENARIOS[selectedScenario];
+  const data = useMemo(() => generateData(scenario), [scenario]);
+  const naive = useMemo(() => linearRegression(data, "x"), [data]);
+  const multi = useMemo(() => multipleRegression(data), [data]);
+  const maxAbs = useMemo(() => Math.max(Math.abs(naive.slope), Math.abs(multi.slopeX), 0.5), [naive, multi]);
+
+  const handleQuizAnswer = (idx) => {
+    if (quizAnswer !== null) return;
+    setQuizAnswer(idx);
+    if (idx === QUIZ_SCENARIOS[quizIndex].correct) setQuizScore((s) => s + 1);
+  };
+
+  const nextQuiz = () => {
+    if (quizIndex < QUIZ_SCENARIOS.length - 1) { setQuizIndex((i) => i + 1); setQuizAnswer(null); }
+    else setQuizDone(true);
+  };
+
+  const resetQuiz = () => { setQuizIndex(0); setQuizAnswer(null); setQuizScore(0); setQuizDone(false); };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "linear-gradient(160deg, #0d1117 0%, #111822 40%, #0f1a24 100%)", color: "#e0e8f0", fontFamily: "'DM Sans', sans-serif", padding: "24px 16px" }}>
+      {/* Header */}
+      <div style={{ maxWidth: 900, margin: "0 auto 28px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 6 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 8, background: "linear-gradient(135deg, rgba(100,140,180,0.3), rgba(255,180,80,0.2))", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{"\u26A1"}</div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, margin: 0, fontFamily: "'Playfair Display', serif", background: "linear-gradient(135deg, #c8daf0, #8ab4e0)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            Confounders in Regression
+          </h1>
+        </div>
+        <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", margin: 0, paddingLeft: 48 }}>
+          Interactive guide &middot; Why correlation &ne; causation and how confounders create misleading estimates
+        </p>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ maxWidth: 900, margin: "0 auto 20px", display: "flex", gap: 4 }}>
+        {[{ id: "explore", label: "Explore Scenarios" }, { id: "concept", label: "Key Concepts" }, { id: "quiz", label: "Practice" }].map((tab) => (
+          <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
+            padding: "8px 18px", borderRadius: 6, border: "1px solid",
+            borderColor: activeTab === tab.id ? "rgba(100,140,180,0.4)" : "rgba(255,255,255,0.08)",
+            background: activeTab === tab.id ? "rgba(100,140,180,0.12)" : "transparent",
+            color: activeTab === tab.id ? "rgba(200,220,240,0.9)" : "rgba(255,255,255,0.4)",
+            cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "'DM Sans', sans-serif", transition: "all 0.2s",
+          }}>{tab.label}</button>
+        ))}
+      </div>
+
+      <div style={{ maxWidth: 900, margin: "0 auto" }}>
+        {/* EXPLORE */}
+        {activeTab === "explore" && (
+          <React.Fragment>
+            <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
+              {SCENARIOS.map((s, i) => (
+                <button key={s.id} onClick={() => { setSelectedScenario(i); setShowConfounder(false); setControlled(false); }} style={{
+                  padding: "6px 14px", borderRadius: 20, border: "1px solid",
+                  borderColor: i === selectedScenario ? "rgba(100,140,180,0.5)" : "rgba(255,255,255,0.1)",
+                  background: i === selectedScenario ? "rgba(100,140,180,0.15)" : "rgba(255,255,255,0.03)",
+                  color: i === selectedScenario ? "#c8daf0" : "rgba(255,255,255,0.45)",
+                  cursor: "pointer", fontSize: 12, fontFamily: "'DM Sans', sans-serif", fontWeight: 500, transition: "all 0.2s",
+                }}>
+                  <span style={{ opacity: 0.5, marginRight: 4 }}>{s.domain}</span> {s.title}
+                </button>
+              ))}
+            </div>
+
+            <div style={{ padding: "14px 18px", borderRadius: 10, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", marginBottom: 20, fontSize: 13, lineHeight: 1.6, color: "rgba(255,255,255,0.6)" }}>
+              {scenario.description}
+            </div>
+
+            <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+              <button onClick={() => { setShowConfounder(!showConfounder); if (showConfounder) setControlled(false); }} style={{
+                padding: "8px 16px", borderRadius: 8, border: "1px solid",
+                borderColor: showConfounder ? "rgba(255,180,80,0.4)" : "rgba(255,255,255,0.12)",
+                background: showConfounder ? "rgba(255,180,80,0.1)" : "rgba(255,255,255,0.04)",
+                color: showConfounder ? "rgba(255,200,120,0.9)" : "rgba(255,255,255,0.5)",
+                cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "'DM Sans', sans-serif", transition: "all 0.25s",
+              }}>
+                {showConfounder ? "\u2713" : "\u25CB"} Reveal Confounder: {scenario.confounder}
+              </button>
+              {showConfounder && (
+                <button onClick={() => setControlled(!controlled)} style={{
+                  padding: "8px 16px", borderRadius: 8, border: "1px solid",
+                  borderColor: controlled ? "rgba(100,220,160,0.4)" : "rgba(255,255,255,0.12)",
+                  background: controlled ? "rgba(100,220,160,0.1)" : "rgba(255,255,255,0.04)",
+                  color: controlled ? "rgba(100,220,160,0.9)" : "rgba(255,255,255,0.5)",
+                  cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "'DM Sans', sans-serif", transition: "all 0.25s",
+                }}>
+                  {controlled ? "\u2713" : "\u25CB"} Control for {scenario.confounder}
+                </button>
+              )}
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: 16 }}>
+              <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 16 }}>
+                <ScatterPlot data={data} width={520} height={340} showConfounder={showConfounder} scenario={scenario} controlled={controlled} />
+                <div style={{ display: "flex", gap: 16, marginTop: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+                    <span style={{ display: "inline-block", width: 20, height: 3, background: controlled ? "rgba(255,100,100,0.3)" : "rgba(255,100,100,0.8)", borderRadius: 2, verticalAlign: "middle", marginRight: 4 }} />
+                    Naive estimate
+                  </span>
+                  {controlled && (
+                    <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+                      <span style={{ display: "inline-block", width: 20, height: 3, background: "rgba(100,220,160,0.9)", borderRadius: 2, verticalAlign: "middle", marginRight: 4 }} />
+                      Controlled estimate
+                    </span>
+                  )}
+                  {showConfounder && (
+                    <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+                      Point color = {scenario.confounder} level
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 12 }}>
+                  <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, color: "rgba(255,255,255,0.3)", marginBottom: 8 }}>Causal Diagram (DAG)</div>
+                  <DAGDiagram scenario={scenario} showConfounder={showConfounder} controlled={controlled} />
+                </div>
+
+                <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 14 }}>
+                  <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, color: "rgba(255,255,255,0.3)", marginBottom: 12 }}>Coefficient Estimates</div>
+                  <CoefficientBar label="Naive (biased)" value={naive.slope} color="rgba(255,100,100,0.8)" maxAbs={maxAbs} />
+                  {controlled && <CoefficientBar label="Controlled" value={multi.slopeX} color="rgba(100,220,160,0.9)" maxAbs={maxAbs} />}
+                  <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 8, lineHeight: 1.5 }}>
+                    True {"\u03B2"} {"\u2248"} {scenario.trueEffect >= 0 ? "+" : ""}{scenario.trueEffect.toFixed(2)}
+                  </div>
+                </div>
+
+                {showConfounder && (
+                  <div style={{ background: "rgba(255,180,80,0.05)", border: "1px solid rgba(255,180,80,0.15)", borderRadius: 12, padding: 14, fontSize: 12, lineHeight: 1.7, color: "rgba(255,220,180,0.7)" }}>
+                    {scenario.explanation}
+                  </div>
+                )}
+              </div>
+            </div>
+          </React.Fragment>
+        )}
+
+        {/* CONCEPTS */}
+        {activeTab === "concept" && (
+          <div style={{ display: "grid", gap: 16 }}>
+            {[
+              { title: "What is a Confounder?", content: "A confounder (Z) is a variable that causally influences BOTH the treatment/predictor (X) and the outcome (Y). It creates a spurious statistical association between X and Y that doesn't reflect a true causal effect. In a DAG: Z \u2192 X and Z \u2192 Y. This creates a \u2018backdoor path\u2019 from X to Y through Z.", color: "rgba(255,180,80,0.15)", border: "rgba(255,180,80,0.25)" },
+              { title: "Omitted Variable Bias", content: "When a confounder is left out of a regression, the coefficient on X absorbs the indirect effect through Z. This is omitted variable bias: \u03B2\u0302\u2093 = \u03B2\u2093 + \u03B2\u1D64 \u00D7 (correlation between X and Z). The bias direction depends on the signs of these relationships. A positive confounder effect on both X and Y creates upward bias.", color: "rgba(100,140,180,0.15)", border: "rgba(100,140,180,0.25)" },
+              { title: "How Controlling Helps", content: "Including the confounder Z in a multiple regression \u2018blocks the backdoor path.\u2019 The coefficient on X now estimates the direct effect of X on Y, holding Z constant. In the scatter plot, this is equivalent to comparing observations with similar Z values. The controlled estimate is closer to the true causal effect.", color: "rgba(100,220,160,0.1)", border: "rgba(100,220,160,0.2)" },
+              { title: "Three Criteria for a Confounder", content: "A variable Z is a confounder of the X \u2192 Y relationship if: (1) Z is associated with X (it predicts the treatment), (2) Z causally affects Y (it independently influences the outcome), and (3) Z is NOT on the causal path from X to Y (it\u2019s not a mediator). All three must hold. A variable that only predicts X, or only affects Y, is not a confounder.", color: "rgba(180,140,220,0.1)", border: "rgba(180,140,220,0.2)" },
+              { title: "Confounder vs. Mediator vs. Collider", content: "Confounder: Z \u2192 X, Z \u2192 Y (control for it). Mediator: X \u2192 Z \u2192 Y (don\u2019t control \u2014 it\u2019s the mechanism). Collider: X \u2192 Z \u2190 Y (don\u2019t control \u2014 it introduces bias). In policy analysis, distinguishing these is critical: controlling for a mediator removes the effect you\u2019re trying to measure, and controlling for a collider creates spurious associations.", color: "rgba(220,160,100,0.1)", border: "rgba(220,160,100,0.2)" },
+              { title: "Policy Implications", content: "In policy evaluation, uncontrolled confounders can make harmful policies look effective (or vice versa). This is why randomized experiments are the gold standard \u2014 randomization breaks the link between Z and X. When experiments aren\u2019t possible, methods like instrumental variables, difference-in-differences, and regression discontinuity try to address confounding.", color: "rgba(100,180,160,0.1)", border: "rgba(100,180,160,0.2)" },
+            ].map((card, i) => (
+              <div key={i} style={{ padding: "16px 20px", borderRadius: 12, background: card.color, border: `1px solid ${card.border}` }}>
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8, color: "rgba(255,255,255,0.85)" }}>{card.title}</div>
+                <div style={{ fontSize: 13, lineHeight: 1.75, color: "rgba(255,255,255,0.6)" }}>{card.content}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* QUIZ */}
+        {activeTab === "quiz" && (
+          <div>
+            {!quizDone ? (
+              <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 24 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                  <span style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: 1.5 }}>Question {quizIndex + 1} of {QUIZ_SCENARIOS.length}</span>
+                  <span style={{ fontSize: 12, color: "rgba(100,220,160,0.7)", fontFamily: "'DM Mono', monospace" }}>Score: {quizScore}/{quizIndex + (quizAnswer !== null ? 1 : 0)}</span>
+                </div>
+                <div style={{ fontSize: 15, lineHeight: 1.7, color: "rgba(255,255,255,0.8)", marginBottom: 24 }}>{QUIZ_SCENARIOS[quizIndex].question}</div>
+                <div style={{ display: "grid", gap: 10, marginBottom: 20 }}>
+                  {QUIZ_SCENARIOS[quizIndex].options.map((opt, i) => {
+                    const isCorrect = i === QUIZ_SCENARIOS[quizIndex].correct;
+                    const isSelected = quizAnswer === i;
+                    const revealed = quizAnswer !== null;
+                    let bg = "rgba(255,255,255,0.03)", border = "rgba(255,255,255,0.08)", col = "rgba(255,255,255,0.6)";
+                    if (revealed && isCorrect) { bg = "rgba(100,220,160,0.1)"; border = "rgba(100,220,160,0.4)"; col = "rgba(100,220,160,0.9)"; }
+                    else if (revealed && isSelected && !isCorrect) { bg = "rgba(255,100,100,0.08)"; border = "rgba(255,100,100,0.3)"; col = "rgba(255,100,100,0.8)"; }
+                    return (
+                      <button key={i} onClick={() => handleQuizAnswer(i)} style={{
+                        padding: "12px 16px", borderRadius: 8, border: `1px solid ${border}`, background: bg,
+                        color: col, cursor: revealed ? "default" : "pointer", fontSize: 13, textAlign: "left",
+                        fontFamily: "'DM Sans', sans-serif", transition: "all 0.2s",
+                      }}>
+                        <span style={{ fontWeight: 600, marginRight: 8, opacity: 0.4 }}>{String.fromCharCode(65 + i)}.</span>{opt}
+                      </button>
+                    );
+                  })}
+                </div>
+                {quizAnswer !== null && (
+                  <div style={{ marginTop: 16 }}>
+                    <div style={{
+                      padding: "14px 18px", borderRadius: 10,
+                      background: quizAnswer === QUIZ_SCENARIOS[quizIndex].correct ? "rgba(100,220,160,0.06)" : "rgba(255,180,80,0.06)",
+                      border: `1px solid ${quizAnswer === QUIZ_SCENARIOS[quizIndex].correct ? "rgba(100,220,160,0.2)" : "rgba(255,180,80,0.2)"}`,
+                      fontSize: 13, lineHeight: 1.7, color: "rgba(255,255,255,0.6)", marginBottom: 16,
+                    }}>{QUIZ_SCENARIOS[quizIndex].explanation}</div>
+                    <button onClick={nextQuiz} style={{
+                      padding: "8px 20px", borderRadius: 8, background: "rgba(100,140,180,0.15)",
+                      border: "1px solid rgba(100,140,180,0.3)", color: "rgba(200,220,240,0.9)",
+                      cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "'DM Sans', sans-serif",
+                    }}>{quizIndex < QUIZ_SCENARIOS.length - 1 ? "Next Question \u2192" : "See Results"}</button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 32, textAlign: "center" }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>{quizScore === QUIZ_SCENARIOS.length ? "\uD83C\uDFAF" : quizScore >= QUIZ_SCENARIOS.length / 2 ? "\uD83D\uDC4D" : "\uD83D\uDCDA"}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 8, fontFamily: "'Playfair Display', serif", color: "rgba(200,220,240,0.9)" }}>{quizScore} / {QUIZ_SCENARIOS.length} Correct</div>
+                <p style={{ fontSize: 13, color: "rgba(255,255,255,0.45)", marginBottom: 20 }}>
+                  {quizScore === QUIZ_SCENARIOS.length ? "Perfect \u2014 you've got a strong grasp of confounding."
+                    : quizScore >= QUIZ_SCENARIOS.length / 2 ? "Good foundation. Review the Explore tab for scenarios you found tricky."
+                    : "Try exploring the scenarios in the Explore tab to build intuition, then retry."}
+                </p>
+                <button onClick={resetQuiz} style={{
+                  padding: "10px 24px", borderRadius: 8, background: "rgba(100,140,180,0.15)",
+                  border: "1px solid rgba(100,140,180,0.3)", color: "rgba(200,220,240,0.9)",
+                  cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "'DM Sans', sans-serif",
+                }}>Try Again</button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(React.createElement(ConfoundingTool), document.getElementById("root"));
+</script>
+</body>
+</html>
